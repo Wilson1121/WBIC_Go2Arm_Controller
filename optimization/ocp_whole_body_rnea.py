@@ -10,7 +10,9 @@ class OCPWholeBodyRNEA(OCP):
     def __init__(self, robot, nodes, tau_nodes, warm_start, include_acc=True):
         super().__init__(robot, nodes, tau_nodes, warm_start)
 
-        self.dyn = DynamicsWholeBodyTorque(self.model, self.mass, self.ee_frames)
+        # Dynamics
+        # 这里把机器人声明的 base frame 一并传下去，避免在 dynamics 层重新假设机身一定叫 base_link。
+        self.dyn = DynamicsWholeBodyTorque(self.model, self.mass, self.ee_frames, self.robot.base_frame_name)
 
         # Nominal State
         self.x_nom = np.concatenate((self.robot.q0, [0] * self.nv))  # joint pos + vel

@@ -9,12 +9,17 @@ class Dynamics:
             model,
             mass,
             ee_frames,
+            base_frame_name="base_link",
         ):
         self.model = cpin.Model(model)
         self.data = self.model.createData()
         self.mass = mass
         self.ee_frames = ee_frames
-        self.base_frame = self.model.getFrameId("base_link")
+
+        # 原仓库默认把机身 frame 写死成 base_link。
+        # 为了兼容 Go2+Piper 这类 base_link 不再等于机身的模型，这里改成由上层显式传入。
+        self.base_frame_name = base_frame_name
+        self.base_frame = self.model.getFrameId(self.base_frame_name)
 
         self.nq = self.model.nq
         self.nv = self.model.nv

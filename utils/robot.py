@@ -1,5 +1,6 @@
 from os.path import dirname, abspath
 
+import numpy as np
 import pinocchio as pin
 from pinocchio.robot_wrapper import RobotWrapper
 
@@ -53,8 +54,14 @@ class Robot:
         self.joint_vel_max = self.model.velocityLimit[6:]
         self.joint_torque_max = self.model.effortLimit[6:]
 
+        # 这两个字段是为后续多机器人适配预留的。
+        # 原项目默认把 base frame 写死成 base_link，但 Go2+Piper 的 base_link 是机械臂底座，
+        # 真正的四足机身 frame 叫 base，所以这里统一改成由机器人子类自己声明。
+        self.base_frame_name = "base_link"
+        self.arm_ee_frame_name = None
+
         # 基类默认表示纯 locomotion 机器人。
-        # 若是 loco-manipulation 机器人，会在子类里重写这两个字段。
+        # 若是 loco-manipulation 机器人，会在子类里重写这些字段。
         self.arm_ee_frame = None  # end-effector frame in URDF
         self.arm_joints = 0  # number of joints to consider (the other ones are locked)
 
@@ -71,7 +78,10 @@ class B2(Robot):
         urdf_path = "robots/b2_description/urdf/b2.urdf"
         srdf_path = "robots/b2_description/srdf/b2.srdf"
         super().__init__(urdf_path, srdf_path, reference_pose)
-        
+
+        # 原始 B2 资产中的机身 frame 就是 base_link。
+        self.base_frame_name = "base_link"
+
         # 参考接触力在前后足之间按经验重量分布分配，
         # 这样做能让 warm start 的接触力初值更接近真实情况。
         self.front_force_ratio = 0.4
@@ -91,11 +101,82 @@ class B2_Z1(Robot):
         super().__init__(urdf_path, srdf_path, reference_pose, lock_joints=lock_joints)
         self.arm_joints = arm_joints  # init sets it to 0
 
+        # B2+Z1 沿用原仓库对机身和末端 frame 的命名假设。
+        self.base_frame_name = "base_link"
+        self.arm_ee_frame_name = "gripperCenter"
+
         if self.arm_joints > 0:
             # 在 loco-manipulation 建模里，机械臂末端允许对环境施加外力，
             # 因此 OCP 会在这里额外引入一个 3 维末端力变量。
-            self.arm_ee_frame = self.model.getFrameId("gripperCenter", type=pin.FIXED_JOINT)
+            self.arm_ee_frame = self.model.getFrameId(self.arm_ee_frame_name, type=pin.FIXED_JOINT)
             self.nf += 3
 
         # 与 B2 相同，warm start 时仍使用近似的前后足载荷分配。
         self.front_force_ratio = 0.4
+
+
+class Go2Piper(Robot):
+    def __init__(self, reference_height=0.445, arm_joints=6):
+        # 这个类专门用于把 Go2+Piper 组合模型接到 unitree_mujoco。
+        # 这里直接使用已经在 MuJoCo 侧验证过的组合 URDF，而不是再复用 B2/Z1 的资产。
+        if arm_joints < 0 or arm_joints > 6:
+            raise ValueError("arm_joints must be in [0, 6] for Go2Piper")
+
+        urdf_path = (
+            "/home/wzx/WholeBodyRL_WS/UnitreeSim2Real/unitree_mujoco/"
+            "unitree_robots/Go2Arm_description/urdf/go2_piper_description_mjc_NoGripper.urdf"
+        )
+
+        # 当前组合模型没有配套 SRDF，也没有论文仓库里的 reference pose，
+        # 所以后面会手工构造一份 standing + arm home 的 q0。
+        srdf_path = None
+        reference_pose = None
+
+        # Pinocchio 读取该 URDF 后，12 条腿关节后面紧跟 6 个机械臂关节。
+        # 如果以后想做 reduced arm model，这里仍然保留和 B2_Z1 一样的锁关节入口。
+        lock_joints = None
+        if arm_joints < 6:
+            lock_idx = 14 + arm_joints  # 14 = universe + base + 12 leg joints
+            lock_joints = range(lock_idx, 20)  # 19 is joint6, so exclusive upper bound is 20
+
+        super().__init__(urdf_path, srdf_path, reference_pose, lock_joints=lock_joints)
+
+        # 对 Go2+Piper 来说，真正的机身 frame 是 base。
+        # 如果这里继续沿用 base_link，后续 whole-body base pose / velocity 都会参考到机械臂底座。
+        self.base_frame_name = "base"
+
+        self.arm_joints = arm_joints
+        self.arm_ee_frame_name = "link6" if arm_joints > 0 else None
+
+        if self.arm_joints > 0:
+            # NoGripper 模型没有 gripperCenter，所以先把 link6 当成末端控制 frame。
+            # 以后如果在 URDF 里额外增加 ee_link，可以只改这个名字，不用改 OCP 主体。
+            self.arm_ee_frame = self.model.getFrameId(self.arm_ee_frame_name)
+            self.nf += 3
+
+        # Go2 也沿用与 B2 相同的前后足载荷初始分配，先保证 warm start 可用。
+        self.front_force_ratio = 0.4
+
+        # 手工构造一份与 MuJoCo home keyframe 对齐的参考姿态。
+        # Pinocchio free-flyer 的四元数顺序是 [x, y, z, w]，因此这里使用 [0, 0, 0, 1]。
+        self.q0 = self._build_home_configuration(reference_height)
+
+    def _build_home_configuration(self, reference_height):
+        q0 = np.array(self.robot.q0, copy=True)
+
+        # 浮动基座放在世界坐标系正立姿态下，z 高度先与 MuJoCo 模型初始高度保持一致。
+        q0[:7] = np.array([0.0, 0.0, reference_height, 0.0, 0.0, 0.0, 1.0])
+
+        # 这一组关节角与当前 MuJoCo WBIC 模型的 home keyframe 保持一致。
+        # 顺序同样和现在的 actuator / sensor 顺序一致：FL, FR, RL, RR, joint1..joint6。
+        # FL_hip, FL_thigh, FL_calf......
+        joint_home = np.array([
+            0.0, 0.67, -1.3,
+            0.0, 0.67, -1.3,
+            0.0, 0.67, -1.3,
+            0.0, 0.67, -1.3,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ])
+
+        q0[7:] = joint_home[: self.nj]
+        return q0
